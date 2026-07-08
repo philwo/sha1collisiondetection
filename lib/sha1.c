@@ -148,35 +148,52 @@
 
 /*
  * SHA1DC_FAST_SHANI: hardware-accelerated fast path (see
- * sha1dc_fast_x86.c). ubc_check() depends only on the expanded message
- * words of a block, not on any chaining state. A block whose dvmask is
- * zero needs no recompression checks, so its compression output is plain
- * SHA-1 and can be computed with SHA-NI instructions. Only flagged blocks
+ * sha1dc_fast_x86.c and sha1dc_fast_arm64.c). ubc_check() depends only
+ * on the expanded message words of a block, not on any chaining state. A
+ * block whose dvmask is zero needs no recompression checks, so its
+ * compression output is plain SHA-1 and can be computed with the SHA-NI
+ * (x86-64) or FEAT_SHA1 (aarch64) instructions. Only flagged blocks
  * (~4.7% for typical data) need the collision-detection work, and because
  * git runs with safe_hash disabled (a detected collision does not alter
  * the hash output), that work can happen out of band while the chaining
- * state always advances via SHA-NI.
+ * state always advances via the hardware instructions.
+ *
+ * SHA1DC_FAST_HAVE_TIER1: the x86-64 fast path has an extra AVX2 tier
+ * (scan8/fused8, level 1) for CPUs without AVX-512; aarch64 only has
+ * levels 0 and 2. Each guard must mirror the compile condition of its
+ * sha1dc_fast_*.c file so the extern symbols exist exactly when used.
  */
 #if defined(__x86_64__) && defined(__GNUC__) && !defined(SHA1DC_NO_FAST_SHANI)
 #define SHA1DC_FAST_SHANI 1
+#define SHA1DC_FAST_HAVE_TIER1 1
+#elif defined(__aarch64__) && defined(__GNUC__) && !defined(SHA1DC_NO_FAST_SHANI) && \
+      (!defined(__BYTE_ORDER__) || __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__) && \
+      (defined(__ARM_FEATURE_SHA2) || defined(__clang__) || __GNUC__ >= 8)
+#define SHA1DC_FAST_SHANI 1
+#endif
 
+#ifdef SHA1DC_FAST_SHANI
 extern int sha1dc_fast_level;
 void sha1dc_fast_compress(uint32_t ihv[5], const unsigned char *data, size_t len);
 void sha1dc_fast_compress_ckpt(uint32_t ihv[5], const unsigned char *p,
 			       unsigned nblocks, uint32_t ckpt[][5]);
-uint32_t sha1dc_fast_scan8(const unsigned char *p, uint32_t dvout[8]);
 uint32_t sha1dc_fast_scan16(const unsigned char *p, uint32_t dvout[16]);
 uint32_t sha1dc_fast_fused16(uint32_t ihv[5], const unsigned char *cur,
 			     const unsigned char *next, uint32_t dvout[16],
 			     uint32_t ckpt[16][5]);
+#ifdef SHA1DC_FAST_HAVE_TIER1
+uint32_t sha1dc_fast_scan8(const unsigned char *p, uint32_t dvout[8]);
 uint32_t sha1dc_fast_fused8(uint32_t ihv[5], const unsigned char *cur,
 			    const unsigned char *next, uint32_t dvout[8],
 			    uint32_t ckpt[8][5]);
+#endif
 void sha1dc_fast_states(const unsigned char *block, uint32_t W[80],
 			const uint32_t ihvin[5],
 			uint32_t state58[5], uint32_t state65[5]);
 
-#if !defined(__clang__) && __GNUC__ >= 14
+#if defined(__clang__)
+#define SHA1DC_NOVECTOR _Pragma("clang loop vectorize(disable)")
+#elif __GNUC__ >= 14
 #define SHA1DC_NOVECTOR _Pragma("GCC novector")
 #else
 #define SHA1DC_NOVECTOR
@@ -1974,6 +1991,7 @@ void SHA1DCUpdate(SHA1_CTX* ctx, const char* buf, size_t len)
 				memcpy(dvs, nextdvs, sizeof(dvs));
 			}
 		}
+#ifdef SHA1DC_FAST_HAVE_TIER1
 		else if (sha1dc_fast_level == 1 && len >= 512)
 		{
 			/*
@@ -2016,6 +2034,7 @@ void SHA1DCUpdate(SHA1_CTX* ctx, const char* buf, size_t len)
 				memcpy(dvs, nextdvs, sizeof(dvs));
 			}
 		}
+#endif /* SHA1DC_FAST_HAVE_TIER1 */
 		/* tail: fewer than one group of blocks */
 		while (len >= 64)
 		{

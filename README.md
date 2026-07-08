@@ -41,7 +41,7 @@ Run:
 make
 ```
 
-## Hardware-accelerated fast path (x86-64)
+## Hardware-accelerated fast path (x86-64 and aarch64)
 
 On x86-64 with GCC or Clang, the library contains an optional fast path
 that uses the SHA-NI instructions together with an AVX-512 or AVX2
@@ -52,6 +52,13 @@ nothing on other platforms. Detection behavior is unchanged: the same
 blocks are flagged and the same recompression checks run, only the
 order of the work differs.
 
+On aarch64 the same design uses the ARMv8 SHA-1 crypto extensions
+(FEAT_SHA1) and a 4-lane NEON version of the check
+(`lib/sha1dc_fast_arm64.c`). It is selected at run time via
+sysctl (macOS) or getauxval (Linux) and has only levels 0 and 2 (there
+is no separate AVX2-style tier). The environment variables below apply
+there as well.
+
 The fast path is used when collision detection is enabled with
 `ubc_check` on and `safe_hash` off (the configuration Git uses). With
 `safe_hash` on (the library default), the original code runs, because
@@ -60,7 +67,9 @@ complete, which is only valid when a detected collision does not alter
 the output.
 
 On an AMD Ryzen 9950X3D this raises throughput from 0.87 GB/s to
-2.25 GB/s on typical data (plain hardware SHA-1: 2.96 GB/s). Two
+2.25 GB/s on typical data (plain hardware SHA-1: 2.96 GB/s). On an
+Apple M2 Ultra it goes from 0.56 GB/s to 1.34 GB/s (plain hardware
+SHA-1: 2.67 GB/s). Two
 environment variables help with testing and benchmarking:
 `SHA1DC_NO_FAST=1` disables the fast path, and `SHA1DC_FAST_LEVEL=0|1|2`
 lowers (never raises) the detected dispatch level

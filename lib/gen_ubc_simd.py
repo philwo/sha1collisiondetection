@@ -7,6 +7,7 @@ Usage:
   gen_ubc_simd.py ubc_check.c LANES --header K -> .h with K inline part
                                                   functions plus an inline
                                                   monolithic wrapper
+  Append --tst for the NEON-friendly statement style (see below).
 
 Translation rules:
 - 'mask &= (bitwise expr);'  -> unchanged (elementwise on vectors).
@@ -18,23 +19,97 @@ Translation rules:
       mask &= -keep | ~DV;
 Anything else fails loudly.
 
+With --tst, statements of the kill-when-set shapes
+  ((X>>K)&1)-1 | ~DVS        (kills DVS when bit K of X is set)
+  (X&(1<<K))-(1<<K) | ~DVS   (valid because no DVS bit is below K; asserted)
+  C-(X&C) | ~DVS             (valid because DVS is a subset of C; asserted)
+are emitted as  mask &= ~((VT)(((X) & bit) != 0) & DVS)  instead, and tail
+conditions as vector comparisons. Semantically identical (the bit-position
+preconditions are asserted); on NEON each test compiles to cmtst+and+bic
+with no shifts. The few bit-alignment statements (<<, ~>>) stay verbatim.
+
 The mask is spread over 4 round-robin accumulators to break the serial
 dependency chain; the final result is their AND.
 """
 import re
 import sys
 
-SRC = sys.argv[1]
-LANES = int(sys.argv[2])
+TST = '--tst' in sys.argv
+argv = [a for a in sys.argv if a != '--tst']
+SRC = argv[1]
+LANES = int(argv[2])
 HEADER_PARTS = 0
-if len(sys.argv) > 4 and sys.argv[3] == '--header':
-    HEADER_PARTS = int(sys.argv[4])
+if len(argv) > 4 and argv[3] == '--header':
+    HEADER_PARTS = int(argv[4])
 
 VT = f'u32v{LANES}'
 src = open(SRC).read()
 
 consts = re.findall(r'static const uint32_t DV_\w+\s*=\s*\(uint32_t\)\(1\) << \d+;', src)
 assert len(consts) == 32, len(consts)
+DV_BIT = {m.group(1): int(m.group(2)) for m in
+          re.finditer(r'static const uint32_t (DV_\w+)\s*=\s*\(uint32_t\)\(1\) << (\d+);', src)}
+
+
+def balanced(s):
+    return s.count('(') == s.count(')')
+
+
+def strip_shift(y):
+    """Split '(X>>K)' into (X, K); otherwise (y, 0)."""
+    my = re.fullmatch(r'\((.*)>>(\d+)\)', y)
+    if my and balanced(my.group(1)):
+        return my.group(1), int(my.group(2))
+    return y, 0
+
+
+def tst_plain(rhs):
+    """Rewrite one 'mask &= (COND | ~DVS);' rhs into tst style, or return
+    None for the bit-alignment shapes (kept verbatim)."""
+    m = re.fullmatch(r'\((.*) \| ~(?:\((DV_[\w|]+)\)|(DV_\w+))\);', rhs.strip())
+    assert m, rhs
+    cond = m.group(1)
+    dvs = m.group(2) or m.group(3)
+    dvbits = [DV_BIT[n] for n in dvs.split('|')]
+
+    # bit-alignment shapes rely on the DV bit position; keep them verbatim
+    if re.fullmatch(r'\(\(\(.*\)<<\d+\)\)|\(~\(.*\)\)', cond):
+        return None
+
+    # (C-(X&C)): kill when set; original keeps only C's bits when clear
+    mc = re.fullmatch(r'\(((?:\(1<<\d+\))|1)-\((.*)&((?:\(1<<\d+\))|1)\)\)', cond)
+    if mc and mc.group(1) == mc.group(3) and balanced(mc.group(2)):
+        c = eval(mc.group(1))
+        assert all((1 << b) == c for b in dvbits), (rhs, c)
+        x, k = mc.group(2), 0
+        if c == 1:
+            x, k = strip_shift(x)
+            c = 1 << k
+        return f'~(({VT})((({x}) & (uint32_t){c}u) != 0) & ({dvs}));'
+
+    # (0-(X&C)): kill when CLEAR; original kills bits below C's bit when set
+    md = re.fullmatch(r'\(0-\((.*)&((?:\(1<<\d+\))|1)\)\)', cond)
+    if md and balanced(md.group(1)):
+        c = eval(md.group(2))
+        assert all((1 << b) & (c - 1) == 0 for b in dvbits), (rhs, c)
+        x, k = md.group(1), 0
+        if c == 1:
+            x, k = strip_shift(x)
+            c = 1 << k
+        return f'~(({VT})((({x}) & (uint32_t){c}u) == 0) & ({dvs}));'
+
+    # ((X&(1<<K))-(1<<K)): kill when set; original kills bits < K when clear
+    mb = re.fullmatch(r'\(\((.*)&\(1<<(\d+)\)\)-\(1<<(\d+)\)\)', cond)
+    if mb and mb.group(2) == mb.group(3) and balanced(mb.group(1)):
+        k = int(mb.group(2))
+        assert all(b >= k for b in dvbits), (rhs, k)
+        return f'~(({VT})((({mb.group(1)}) & (1u<<{k})) != 0) & ({dvs}));'
+
+    # (((X>>K)&1)-1) or ((X&1)-1): kill when bit K (or 0) of X is set
+    ma = re.fullmatch(r'\(\((.*)&1\)-1\)', cond)
+    assert ma, rhs
+    x, k = strip_shift(ma.group(1))
+    return f'~(({VT})((({x}) & (1u<<{k})) != 0) & ({dvs}));'
 
 m = re.search(r'void ubc_check\(const uint32_t W\[80\], uint32_t dvmask\[1\]\)\n\{\n(.*)\n\}', src, re.S)
 body = m.group(1)
@@ -67,7 +142,12 @@ while i < len(lines):
         i += 1
         continue
     if line.startswith('mask &='):
-        stmts.append(['\t' + next_acc() + ' &=' + line[len('mask &='):]])
+        rhs = line[len('mask &='):].strip()
+        t = tst_plain(rhs) if TST else None
+        if t is not None:
+            stmts.append(['\t' + next_acc() + ' &= ' + t])
+        else:
+            stmts.append(['\t' + next_acc() + ' &=' + line[len('mask &='):]])
         n_plain += 1
         i += 1
         continue
@@ -100,15 +180,23 @@ while i < len(lines):
                 assert mm, t
                 x, k = mm.group(1), mm.group(2)
                 neg = False
-            expr = f'((({x}) >> {k}) & 1)'
-            if neg:
-                expr = f'({expr} ^ 1)'
+            if TST:
+                # keep is a full-lane mask (-1 keeps) instead of 0/1;
+                # each source term is a kill condition, so keep negates it
+                expr = f'(({VT})((({x}) & (1u<<{k})) {"==" if neg else "!="} 0))'
+            else:
+                expr = f'((({x}) >> {k}) & 1)'
+                if neg:
+                    expr = f'({expr} ^ 1)'
             keeps.append(expr)
         n_cond += 1
         chunk = ['\t{', f'\t\t{VT} keep = {keeps[0]};']
         for k in keeps[1:]:
             chunk.append(f'\t\tkeep &= {k};')
-        chunk.append(f'\t\t{next_acc()} &= -keep | ~{dv};')
+        if TST:
+            chunk.append(f'\t\t{next_acc()} &= keep | ~{dv};')
+        else:
+            chunk.append(f'\t\t{next_acc()} &= -keep | ~{dv};')
         chunk.append('\t}')
         stmts.append(chunk)
         continue
