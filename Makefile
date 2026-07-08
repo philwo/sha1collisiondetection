@@ -155,6 +155,11 @@ $(SRC_OBJ_DIR)/%.lo ${SRC_OBJ_DIR}/%.o: ${SRC_DIR}/%.c ${SRC_DEP_DIR}/%.d $(H_DE
 	$(MKDIR) $(shell dirname $@) && $(CC) $(CFLAGS) -o $@ -c $<
 
 
+# The SHA-NI/AVX fast path uses intrinsics and GNU extensions and cannot
+# be built as pedantic C90. It only contains code on x86-64 GCC/Clang and
+# compiles to an empty object elsewhere.
+$(LIB_DEP_DIR)/sha1dc_fast_x86.d $(LIB_OBJ_DIR)/sha1dc_fast_x86.lo $(LIB_OBJ_DIR)/sha1dc_fast_x86.o: CFLAGS:=$(filter-out -std=c90 -pedantic,$(CFLAGS)) -std=gnu99
+
 $(LIB_DEP_DIR)/%.d: $(LIB_DIR)/%.c
 	$(MKDIR) $(shell dirname $@) && $(CC_DEP) $(CFLAGS) -M -MF $@ $<
 

@@ -41,6 +41,31 @@ Run:
 make
 ```
 
+## Hardware-accelerated fast path (x86-64)
+
+On x86-64 with GCC or Clang, the library contains an optional fast path
+that uses the SHA-NI instructions together with an AVX-512 or AVX2
+vectorized version of the unavoidable-bit-conditions check
+(`lib/sha1dc_fast_x86.c`, `lib/ubc_check_simd.h`). It is selected at
+run time via cpuid, needs no special compiler flags, and compiles to
+nothing on other platforms. Detection behavior is unchanged: the same
+blocks are flagged and the same recompression checks run, only the
+order of the work differs.
+
+The fast path is used when collision detection is enabled with
+`ubc_check` on and `safe_hash` off (the configuration Git uses). With
+`safe_hash` on (the library default), the original code runs, because
+the fast path advances the hash state before the collision checks
+complete, which is only valid when a detected collision does not alter
+the output.
+
+On an AMD Ryzen 9950X3D this raises throughput from 0.87 GB/s to
+2.25 GB/s on typical data (plain hardware SHA-1: 2.96 GB/s). Two
+environment variables help with testing and benchmarking:
+`SHA1DC_NO_FAST=1` disables the fast path, and `SHA1DC_FAST_LEVEL=0|1|2`
+lowers (never raises) the detected dispatch level
+(0 = off, 1 = SHA-NI+AVX2, 2 = SHA-NI+AVX-512).
+
 ## Command-line usage
 
 There are two programs `bin/sha1dcsum` and `bin/sha1dcsum_partialcoll`.
