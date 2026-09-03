@@ -1771,26 +1771,24 @@ static void sha1_recompression_step(uint32_t step, uint32_t ihvin[5], uint32_t i
 
 
 
-#ifdef SHA1DC_FAST_SHANI
 /*
- * Verify a flagged block out of band: the chaining state has already been
- * advanced with SHA-NI (valid because safe_hash is off, so a collision
- * does not alter the hash output). ihvin and ihvout are the chaining
- * values entering and leaving the block, both known from the SHA-NI
- * checkpoints; dvmask is the block's ubc_check result computed by the
- * vector scan. So the only compression state recomputed here is the
- * working state at the recompression steps (58 and 65), which
- * sha1dc_fast_states produces mostly with SHA-NI.
+ * Run the recompression checks of the disturbance vectors selected by
+ * dvmask on the block whose expanded message is in ctx->m1. ihvin and
+ * ihvout are the chaining values entering and leaving the block; state58
+ * and state65 are the compression states entering steps 58 and 65, the
+ * only steps a DV can test (DOSTORESTATE58/65 in ubc_check.h). Returns 1
+ * if a collision was found.
  */
-static void sha1_verify_flagged(SHA1_CTX *ctx, const uint32_t ihvin[5],
-				const uint32_t ihvout[5],
-				const unsigned char *blockp, uint32_t dvmask)
+#if !defined(DOSTORESTATE58) || !defined(DOSTORESTATE65)
+#error "sha1_check_dvs expects the DVs to test at steps 58 and 65"
+#endif
+static int sha1_check_dvs(SHA1_CTX *ctx, uint32_t dvmask,
+			  const uint32_t ihvin[5], const uint32_t ihvout[5],
+			  const uint32_t state58[5], const uint32_t state65[5])
 {
 	uint32_t ihvtmp[5];
-	uint32_t state58[5], state65[5];
 	unsigned i, j;
 
-	sha1dc_fast_states(blockp, ctx->m1, ihvin, state58, state65);
 	for (i = 0; sha1_dvs[i].dvType != 0; ++i)
 	{
 		if (dvmask & ((uint32_t)(1) << sha1_dvs[i].maskb))
@@ -1801,22 +1799,87 @@ static void sha1_verify_flagged(SHA1_CTX *ctx, const uint32_t ihvin[5],
 			sha1_recompression_step(sha1_dvs[i].testt, ctx->ihv2, ihvtmp, ctx->m2,
 						sha1_dvs[i].testt == 58 ? state58 : state65);
 
+			/* to verify SHA-1 collision detection code with collisions for reduced-step SHA-1 */
 			if ((0 == ((ihvtmp[0] ^ ihvout[0]) | (ihvtmp[1] ^ ihvout[1]) | (ihvtmp[2] ^ ihvout[2]) | (ihvtmp[3] ^ ihvout[3]) | (ihvtmp[4] ^ ihvout[4])))
 				|| (ctx->reduced_round_coll && 0 == ((ihvin[0] ^ ctx->ihv2[0]) | (ihvin[1] ^ ctx->ihv2[1]) | (ihvin[2] ^ ctx->ihv2[2]) | (ihvin[3] ^ ctx->ihv2[3]) | (ihvin[4] ^ ctx->ihv2[4]))))
-			{
-				ctx->found_collision = 1;
-				break;
-			}
+				return 1;
 		}
 	}
+	return 0;
+}
+
+#ifdef SHA1DC_FAST_SHANI
+/*
+ * Verify a flagged block out of band: the chaining state has already been
+ * advanced with the hardware instructions (valid because safe_hash is
+ * off, so a collision does not alter the hash output). ihvin and ihvout
+ * are the chaining values entering and leaving the block, both known from
+ * the checkpoints; dvmask is the block's ubc_check result computed by the
+ * vector scan. So the only compression state recomputed here is the
+ * working state at the recompression steps (58 and 65), which
+ * sha1dc_fast_states produces mostly with the hardware instructions.
+ */
+static void sha1_verify_flagged(SHA1_CTX *ctx, const uint32_t ihvin[5],
+				const uint32_t ihvout[5],
+				const unsigned char *blockp, uint32_t dvmask)
+{
+	uint32_t state58[5], state65[5];
+
+	sha1dc_fast_states(blockp, ctx->m1, ihvin, state58, state65);
+	if (sha1_check_dvs(ctx, dvmask, ihvin, ihvout, state58, state65))
+		ctx->found_collision = 1;
+}
+
+/*
+ * Process as many whole groups of nblocks blocks as len holds and return
+ * the number of bytes consumed. The fused kernel compresses the current
+ * group with the hardware instructions while scanning the next group
+ * with the vector unit in the shadow of the latency-bound round
+ * instruction chain, and checkpoints the chaining value entering each
+ * block. Flagged blocks are then verified out of band.
+ */
+static size_t sha1_fast_groups(SHA1_CTX *ctx, const unsigned char *buf, size_t len,
+			       unsigned nblocks, sha1dc_fast_scan_fn scan,
+			       sha1dc_fast_fused_fn fused)
+{
+	size_t group = (size_t)nblocks * 64, done = 0;
+	uint32_t dvs[16], nextdvs[16];
+	uint32_t ckpt[16][5];
+	uint32_t flags;
+
+	if (len < group)
+		return 0;
+	flags = scan(buf, dvs);
+	for (;;)
+	{
+		uint32_t nextflags = 0;
+		int have_next = (len - done >= 2 * group);
+		unsigned i;
+
+		if (have_next)
+			nextflags = fused(ctx->ihv, buf, buf + group, nextdvs, ckpt);
+		else
+			sha1dc_fast_compress_ckpt(ctx->ihv, buf, nblocks, ckpt);
+		for (i = 0; flags; i++, flags >>= 1)
+			if (flags & 1)
+				sha1_verify_flagged(ctx, ckpt[i],
+						    i + 1 < nblocks ? ckpt[i + 1] : ctx->ihv,
+						    buf + i * 64, dvs[i]);
+		ctx->total += group;
+		buf += group;
+		done += group;
+		if (!have_next)
+			break;
+		flags = nextflags;
+		memcpy(dvs, nextdvs, sizeof(dvs));
+	}
+	return done;
 }
 #endif /* SHA1DC_FAST_SHANI */
 
 static void sha1_process(SHA1_CTX* ctx, const uint32_t block[16])
 {
-	unsigned i, j;
 	uint32_t ubc_dv_mask[DVMASKSIZE] = { 0xFFFFFFFF };
-	uint32_t ihvtmp[5];
 
 	ctx->ihv1[0] = ctx->ihv[0];
 	ctx->ihv1[1] = ctx->ihv[1];
@@ -1833,32 +1896,16 @@ static void sha1_process(SHA1_CTX* ctx, const uint32_t block[16])
 			ubc_check(ctx->m1, ubc_dv_mask);
 		}
 
-		if (ubc_dv_mask[0] != 0)
+		if (ubc_dv_mask[0] != 0 &&
+		    sha1_check_dvs(ctx, ubc_dv_mask[0], ctx->ihv1, ctx->ihv,
+				   ctx->states[58], ctx->states[65]))
 		{
-			for (i = 0; sha1_dvs[i].dvType != 0; ++i)
+			ctx->found_collision = 1;
+
+			if (ctx->safe_hash)
 			{
-				if (ubc_dv_mask[0] & ((uint32_t)(1) << sha1_dvs[i].maskb))
-				{
-					for (j = 0; j < 80; ++j)
-						ctx->m2[j] = ctx->m1[j] ^ sha1_dvs[i].dm[j];
-
-					sha1_recompression_step(sha1_dvs[i].testt, ctx->ihv2, ihvtmp, ctx->m2, ctx->states[sha1_dvs[i].testt]);
-
-					/* to verify SHA-1 collision detection code with collisions for reduced-step SHA-1 */
-					if ((0 == ((ihvtmp[0] ^ ctx->ihv[0]) | (ihvtmp[1] ^ ctx->ihv[1]) | (ihvtmp[2] ^ ctx->ihv[2]) | (ihvtmp[3] ^ ctx->ihv[3]) | (ihvtmp[4] ^ ctx->ihv[4])))
-						|| (ctx->reduced_round_coll && 0==((ctx->ihv1[0] ^ ctx->ihv2[0]) | (ctx->ihv1[1] ^ ctx->ihv2[1]) | (ctx->ihv1[2] ^ ctx->ihv2[2]) | (ctx->ihv1[3] ^ ctx->ihv2[3]) | (ctx->ihv1[4] ^ ctx->ihv2[4]))))
-					{
-						ctx->found_collision = 1;
-
-						if (ctx->safe_hash)
-						{
-							sha1_compression_W(ctx->ihv, ctx->m1);
-							sha1_compression_W(ctx->ihv, ctx->m1);
-						}
-
-						break;
-					}
-				}
+				sha1_compression_W(ctx->ihv, ctx->m1);
+				sha1_compression_W(ctx->ihv, ctx->m1);
 			}
 		}
 	}
@@ -1940,111 +1987,36 @@ void SHA1DCUpdate(SHA1_CTX* ctx, const char* buf, size_t len)
 #ifdef SHA1DC_FAST_SHANI
 	if (sha1dc_fast_level && ctx->detect_coll && ctx->ubc_check && !ctx->safe_hash)
 	{
-		if (sha1dc_fast_level >= 2 && len >= 1024)
-		{
-			/*
-			 * Process 16-block groups. The fused kernel compresses
-			 * the current group with SHA-NI while scanning the
-			 * next group with AVX-512 in the shadow of the
-			 * latency-bound sha1rnds4 chain, and checkpoints the
-			 * chaining value entering each block. Flagged blocks
-			 * are then verified out of band.
-			 */
-			uint32_t dvs[16], nextdvs[16];
-			uint32_t ckpt[16][5];
-			uint32_t flags = sha1dc_fast_scan16((const unsigned char *)buf, dvs);
+		const unsigned char *p = (const unsigned char *)buf;
+		size_t n = 0;
 
-			for (;;)
-			{
-				uint32_t nextflags = 0;
-				int have_next = (len >= 2048);
-
-				if (have_next)
-					nextflags = sha1dc_fast_fused16(ctx->ihv, (const unsigned char *)buf,
-									(const unsigned char *)buf + 1024, nextdvs, ckpt);
-				else
-					sha1dc_fast_compress_ckpt(ctx->ihv, (const unsigned char *)buf, 16, ckpt);
-				if (flags)
-				{
-					unsigned i;
-
-					for (i = 0; i < 16; i++)
-						if (flags & (1u << i))
-							sha1_verify_flagged(ctx, ckpt[i],
-									    i < 15 ? ckpt[i + 1] : ctx->ihv,
-									    (const unsigned char *)buf + i * 64, dvs[i]);
-				}
-				ctx->total += 1024;
-				buf += 1024;
-				len -= 1024;
-				if (!have_next)
-					break;
-				flags = nextflags;
-				memcpy(dvs, nextdvs, sizeof(dvs));
-			}
-		}
+		/* 16-block groups with the AVX-512 or NEON scan, 8-block groups with AVX2 */
+		if (sha1dc_fast_level >= 2)
+			n = sha1_fast_groups(ctx, p, len, 16, sha1dc_fast_scan16, sha1dc_fast_fused16);
 #ifdef SHA1DC_FAST_HAVE_TIER1
-		else if (sha1dc_fast_level == 1 && len >= 512)
-		{
-			/*
-			 * AVX2 tier: 8-block groups, same structure as the
-			 * AVX-512 tier above. The fused kernel compresses the
-			 * current group with SHA-NI while scanning the next
-			 * one with AVX2; flagged blocks are verified out of
-			 * band using the checkpointed chaining values.
-			 */
-			uint32_t dvs[8], nextdvs[8];
-			uint32_t ckpt[8][5];
-			uint32_t flags = sha1dc_fast_scan8((const unsigned char *)buf, dvs);
+		else
+			n = sha1_fast_groups(ctx, p, len, 8, sha1dc_fast_scan8, sha1dc_fast_fused8);
+#endif
+		p += n;
+		len -= n;
 
-			for (;;)
-			{
-				uint32_t nextflags = 0;
-				int have_next = (len >= 1024);
-
-				if (have_next)
-					nextflags = sha1dc_fast_fused8(ctx->ihv, (const unsigned char *)buf,
-								       (const unsigned char *)buf + 512, nextdvs, ckpt);
-				else
-					sha1dc_fast_compress_ckpt(ctx->ihv, (const unsigned char *)buf, 8, ckpt);
-				if (flags)
-				{
-					unsigned i;
-
-					for (i = 0; i < 8; i++)
-						if (flags & (1u << i))
-							sha1_verify_flagged(ctx, ckpt[i],
-									    i < 7 ? ckpt[i + 1] : ctx->ihv,
-									    (const unsigned char *)buf + i * 64, dvs[i]);
-				}
-				ctx->total += 512;
-				buf += 512;
-				len -= 512;
-				if (!have_next)
-					break;
-				flags = nextflags;
-				memcpy(dvs, nextdvs, sizeof(dvs));
-			}
-		}
-#endif /* SHA1DC_FAST_HAVE_TIER1 */
-		/* tail: fewer than one group of blocks */
+		/* tail: fewer than one group of blocks, scanned one at a time */
 		while (len >= 64)
 		{
 			uint32_t W[80], dvmask[DVMASKSIZE];
+			uint32_t ihvin[5];
 
-			sha1_expand_block((const unsigned char *)buf, W);
+			sha1_expand_block(p, W);
 			ubc_check(W, dvmask);
-			ctx->total += 64;
+			memcpy(ihvin, ctx->ihv, sizeof(ihvin));
+			sha1dc_fast_compress(ctx->ihv, p, 64);
 			if (dvmask[0])
-			{
-				memcpy(ctx->buffer, buf, 64);
-				sha1_process(ctx, (uint32_t *)(ctx->buffer));
-			}
-			else
-				sha1dc_fast_compress(ctx->ihv, (const unsigned char *)buf, 64);
-			buf += 64;
+				sha1_verify_flagged(ctx, ihvin, ctx->ihv, p, dvmask[0]);
+			ctx->total += 64;
+			p += 64;
 			len -= 64;
 		}
+		buf = (const char *)p;
 	}
 	else if (sha1dc_fast_level && !ctx->detect_coll)
 	{
