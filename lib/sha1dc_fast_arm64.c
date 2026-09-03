@@ -9,8 +9,9 @@
  * runs on NEON with 4 blocks per pass; sha1dc_fast_scan16 and
  * sha1dc_fast_fused16 process 16-block groups by running four 4-lane
  * scans, so sha1.c can use the same group loop on both architectures.
- * There is no tier-1 (scan8/fused8) variant here: sha1dc_fast_level is
- * either 0 (off) or 2 (fast).
+ * There is no tier-1 (scan8/fused8) variant here: sha1dc_fast_level
+ * (set by sha1.c from sha1dc_fast_detect_level()) is either 0 (off) or
+ * 2 (fast).
  *
  * The SHA-1 block step is based on code written and placed in the public
  * domain by Jeffrey Walton (sha1-arm.c, github.com/noloader/SHA-Intrinsics).
@@ -25,36 +26,31 @@
 #include SHA1DC_CUSTOM_INCLUDE_SHA1DC_FAST_ARM64_C
 #endif
 
-#if defined(__aarch64__) && defined(__GNUC__) && !defined(SHA1DC_NO_FAST_SHANI) && \
-    (!defined(__BYTE_ORDER__) || __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#include "sha1dc_fast.h"
 
-/*
- * The vsha1* intrinsics need the sha2 target feature. Apple compilers
- * predefine __ARM_FEATURE_SHA2, so no attribute is needed there; other
- * compilers get a per-function target attribute. If neither works, the
- * file compiles to nothing and sha1.c must not define SHA1DC_FAST_SHANI
- * (its guard mirrors this condition).
- */
-#if defined(__ARM_FEATURE_SHA2)
-#define SHA1DC_TGT_SHA1
-#define SHA1DC_FAST_ARM64 1
-#elif defined(__clang__)
-#define SHA1DC_TGT_SHA1 __attribute__((target("sha2")))
-#define SHA1DC_FAST_ARM64 1
-#elif __GNUC__ >= 8
-#define SHA1DC_TGT_SHA1 __attribute__((target("+sha2")))
-#define SHA1DC_FAST_ARM64 1
-#endif
-
-#ifdef SHA1DC_FAST_ARM64
+#if defined(SHA1DC_FAST_SHANI) && defined(__aarch64__)
 
 #include <arm_neon.h>
 
+#include "sha1dc_fast_impl.h"
 #include "ubc_check_simd.h"
 
-int sha1dc_fast_level;
-
-#define SHA1DC_INLINE static inline __attribute__((always_inline))
+/*
+ * The vsha1* intrinsics need the sha2 target feature. Apple compilers
+ * predefine __ARM_FEATURE_SHA2 (as does any -march with +sha2/+crypto),
+ * so no attribute is needed there; other compilers get a per-function
+ * target attribute. GCC 8-12 define the intrinsics under +crypto and
+ * refuse to inline them into a +sha2 function; GCC 13 switched to +sha2.
+ */
+#if defined(__ARM_FEATURE_SHA2)
+#define SHA1DC_TGT_SHA1
+#elif defined(__clang__)
+#define SHA1DC_TGT_SHA1 __attribute__((target("sha2")))
+#elif __GNUC__ >= 13
+#define SHA1DC_TGT_SHA1 __attribute__((target("+sha2")))
+#else
+#define SHA1DC_TGT_SHA1 __attribute__((target("+crypto")))
+#endif
 
 /*
  * One SHA-1 block step with the ARMv8 SHA-1 instructions. ABCD holds
@@ -322,18 +318,13 @@ void sha1dc_fast_compress_ckpt(uint32_t ihv[5], const unsigned char *p,
 	sha1neon_store_state(ABCD, E, ihv);
 }
 
-#define rol32(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
-
 /*
  * Prepare the data a flagged block's recompression checks need: the
  * decoded and expanded message W[80] and the sha1_compression_states()
  * snapshots at steps 58 and 65. sha1neon_block1_impl in collect mode
  * runs the full message schedule with sha1su0/sha1su1 (storing each
  * group to W) and the rounds up to 55 with the sha1 round instructions;
- * only rounds 56-64 run as scalar code here. The snapshots use the
- * rotating-variable order of SHA1_STORE_STATE in sha1.c: at step 58 the
- * stored words are {D,E,A,B,C} of the logical state, at step 65 they
- * are {A,B,C,D,E}.
+ * only rounds 56-64 run as scalar code, in sha1dc_fast_states_tail.
  */
 SHA1DC_TGT_SHA1
 void sha1dc_fast_states(const unsigned char *block, uint32_t W[80],
@@ -350,31 +341,7 @@ void sha1dc_fast_states(const unsigned char *block, uint32_t W[80],
 	b = vgetq_lane_u32(ABCD, 1);
 	c = vgetq_lane_u32(ABCD, 2);
 	d = vgetq_lane_u32(ABCD, 3);
-
-#define FAST_ROUND(f, k, t) do { \
-	uint32_t tmp = rol32(a, 5) + (f) + e + (k) + W[t]; \
-	e = d; d = c; c = rol32(b, 30); b = a; a = tmp; \
-} while (0)
-#define FAST_ROUND3(t) FAST_ROUND(((b & c) + (d & (b ^ c))), 0x8F1BBCDC, t)
-#define FAST_ROUND4(t) FAST_ROUND((b ^ c ^ d), 0xCA62C1D6, t)
-
-	FAST_ROUND3(56);
-	FAST_ROUND3(57);
-	state58[0] = d; state58[1] = e; state58[2] = a;
-	state58[3] = b; state58[4] = c;
-	FAST_ROUND3(58);
-	FAST_ROUND3(59);
-	FAST_ROUND4(60);
-	FAST_ROUND4(61);
-	FAST_ROUND4(62);
-	FAST_ROUND4(63);
-	FAST_ROUND4(64);
-	state65[0] = a; state65[1] = b; state65[2] = c;
-	state65[3] = d; state65[4] = e;
-
-#undef FAST_ROUND
-#undef FAST_ROUND3
-#undef FAST_ROUND4
+	sha1dc_fast_states_tail(a, b, c, d, e, W, state58, state65);
 }
 
 /*
@@ -495,7 +462,7 @@ uint32_t scan4(const unsigned char *p, uint32_t dvout[4])
 }
 
 /* Scan 16 consecutive blocks as four 4-lane scans. */
-uint32_t sha1dc_fast_scan16(const unsigned char *p, uint32_t dvout[16])
+uint32_t sha1dc_fast_scan16(const unsigned char *p, uint32_t *dvout)
 {
 	return scan4(p, dvout)
 	     | scan4(p + 256, dvout + 4) << 4
@@ -516,8 +483,8 @@ uint32_t sha1dc_fast_scan16(const unsigned char *p, uint32_t dvout[16])
  */
 SHA1DC_TGT_SHA1
 uint32_t sha1dc_fast_fused16(uint32_t ihv[5], const unsigned char *cur,
-			     const unsigned char *next, uint32_t dvout[16],
-			     uint32_t ckpt[16][5])
+			     const unsigned char *next, uint32_t *dvout,
+			     uint32_t ckpt[][5])
 {
 	uint32x4_t ABCD;
 	uint32_t E;
@@ -572,7 +539,7 @@ uint32_t sha1dc_fast_fused16(uint32_t ihv[5], const unsigned char *cur,
 
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
-static int sha1dc_detect_fast_level(void)
+int sha1dc_fast_detect_level(void)
 {
 	int v = 0;
 	size_t sz = sizeof(v);
@@ -586,31 +553,15 @@ static int sha1dc_detect_fast_level(void)
 #ifndef HWCAP_SHA1
 #define HWCAP_SHA1 (1UL << 5)
 #endif
-static int sha1dc_detect_fast_level(void)
+int sha1dc_fast_detect_level(void)
 {
 	return (getauxval(AT_HWCAP) & HWCAP_SHA1) ? 2 : 0;
 }
 #else
-static int sha1dc_detect_fast_level(void)
+int sha1dc_fast_detect_level(void)
 {
 	return 0;
 }
 #endif
 
-static void sha1dc_fast_init(void) __attribute__((constructor));
-static void sha1dc_fast_init(void)
-{
-	const char *s;
-
-	if (getenv("SHA1DC_NO_FAST"))
-		return;
-	sha1dc_fast_level = sha1dc_detect_fast_level();
-	/* SHA1DC_FAST_LEVEL can lower (never raise) the level, for A/B tests. */
-	s = getenv("SHA1DC_FAST_LEVEL");
-	if (s && s[0] >= '0' && s[0] <= '2' && !s[1] &&
-	    s[0] - '0' < sha1dc_fast_level)
-		sha1dc_fast_level = s[0] - '0';
-}
-
-#endif /* SHA1DC_FAST_ARM64 */
-#endif /* __aarch64__ && __GNUC__ && !SHA1DC_NO_FAST_SHANI && little-endian */
+#endif /* SHA1DC_FAST_SHANI && __aarch64__ */

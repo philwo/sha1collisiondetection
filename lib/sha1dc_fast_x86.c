@@ -8,7 +8,7 @@
  * with AVX2 or AVX-512 (one block per vector lane) and compress with
  * SHA-NI. Everything is compiled with GCC target attributes and selected
  * at run time via sha1dc_fast_level (0 = off, 1 = SHA-NI+AVX2,
- * 2 = SHA-NI+AVX-512).
+ * 2 = SHA-NI+AVX-512), which sha1.c sets from sha1dc_fast_detect_level().
  *
  * The SHA-NI block step is based on code written and placed in the public
  * domain by Jeffrey Walton (sha1-x86.c, github.com/noloader/SHA-Intrinsics),
@@ -24,19 +24,19 @@
 #include SHA1DC_CUSTOM_INCLUDE_SHA1DC_FAST_X86_C
 #endif
 
-#if defined(__x86_64__) && defined(__GNUC__) && !defined(SHA1DC_NO_FAST_SHANI)
+#include "sha1dc_fast.h"
+
+#if defined(SHA1DC_FAST_SHANI) && defined(__x86_64__)
 
 #include <immintrin.h>
 #include <cpuid.h>
 
+#include "sha1dc_fast_impl.h"
 #include "ubc_check_simd.h"
-
-int sha1dc_fast_level;
 
 #define SHA1DC_TGT_SHANI __attribute__((target("sha,sse4.1")))
 #define SHA1DC_TGT_AVX2 __attribute__((target("sha,sse4.1,avx2")))
 #define SHA1DC_TGT_AVX512 __attribute__((target("sha,sse4.1,avx512f,avx512bw")))
-#define SHA1DC_INLINE static inline __attribute__((always_inline))
 
 /*
  * One SHA-1 block step with SHA-NI. ABCD holds a,b,c,d (element order
@@ -325,17 +325,13 @@ void sha1dc_fast_compress_ckpt(uint32_t ihv[5], const unsigned char *p,
 	sha1ni_store_state(ABCD, E0, ihv);
 }
 
-#define rol32(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
-
 /*
  * Prepare the data a flagged block's recompression checks need: the
  * decoded and expanded message W[80] and the sha1_compression_states()
  * snapshots at steps 58 and 65. sha1ni_block1_impl in collect mode runs
  * the full message schedule with sha1msg1/sha1msg2 (storing each group
  * to W) and the rounds up to 55 with sha1rnds4; only rounds 56-64 run
- * as scalar code here. The snapshots use the rotating-variable order of
- * SHA1_STORE_STATE in sha1.c: at step 58 the stored words are
- * {D,E,A,B,C} of the logical state, at step 65 they are {A,B,C,D,E}.
+ * as scalar code, in sha1dc_fast_states_tail.
  */
 SHA1DC_TGT_SHANI
 void sha1dc_fast_states(const unsigned char *block, uint32_t W[80],
@@ -353,31 +349,7 @@ void sha1dc_fast_states(const unsigned char *block, uint32_t W[80],
 	c = (uint32_t)_mm_extract_epi32(ABCD, 1);
 	d = (uint32_t)_mm_extract_epi32(ABCD, 0);
 	e = rol32(a52, 30);	/* E_56 = rol(A_52, 30) */
-
-#define FAST_ROUND(f, k, t) do { \
-	uint32_t tmp = rol32(a, 5) + (f) + e + (k) + W[t]; \
-	e = d; d = c; c = rol32(b, 30); b = a; a = tmp; \
-} while (0)
-#define FAST_ROUND3(t) FAST_ROUND(((b & c) + (d & (b ^ c))), 0x8F1BBCDC, t)
-#define FAST_ROUND4(t) FAST_ROUND((b ^ c ^ d), 0xCA62C1D6, t)
-
-	FAST_ROUND3(56);
-	FAST_ROUND3(57);
-	state58[0] = d; state58[1] = e; state58[2] = a;
-	state58[3] = b; state58[4] = c;
-	FAST_ROUND3(58);
-	FAST_ROUND3(59);
-	FAST_ROUND4(60);
-	FAST_ROUND4(61);
-	FAST_ROUND4(62);
-	FAST_ROUND4(63);
-	FAST_ROUND4(64);
-	state65[0] = a; state65[1] = b; state65[2] = c;
-	state65[3] = d; state65[4] = e;
-
-#undef FAST_ROUND
-#undef FAST_ROUND3
-#undef FAST_ROUND4
+	sha1dc_fast_states_tail(a, b, c, d, e, W, state58, state65);
 }
 
 /* Transpose the 8x8 dword matrix r0..r7 into out[0..7]. */
@@ -463,7 +435,7 @@ uint32_t scan8_result(u32v8 dv, uint32_t dvout[8])
  * at W[64].
  */
 SHA1DC_TGT_AVX2
-uint32_t sha1dc_fast_scan8(const unsigned char *p, uint32_t dvout[8])
+uint32_t sha1dc_fast_scan8(const unsigned char *p, uint32_t *dvout)
 {
 	u32v8 W[65];
 	u32v8 dv;
@@ -548,7 +520,7 @@ uint32_t scan16_result(u32v16 dv, uint32_t dvout[16])
 
 /* Scan 16 consecutive blocks, one per AVX-512 lane. */
 SHA1DC_TGT_AVX512
-uint32_t sha1dc_fast_scan16(const unsigned char *p, uint32_t dvout[16])
+uint32_t sha1dc_fast_scan16(const unsigned char *p, uint32_t *dvout)
 {
 	__m512i r[16], b[16];
 	u32v16 W[65];
@@ -572,8 +544,8 @@ uint32_t sha1dc_fast_scan16(const unsigned char *p, uint32_t dvout[16])
  */
 SHA1DC_TGT_AVX512
 uint32_t sha1dc_fast_fused16(uint32_t ihv[5], const unsigned char *cur,
-			     const unsigned char *next, uint32_t dvout[16],
-			     uint32_t ckpt[16][5])
+			     const unsigned char *next, uint32_t *dvout,
+			     uint32_t ckpt[][5])
 {
 	__m128i ABCD, E0;
 	__m512i r[16], b[16];
@@ -636,8 +608,8 @@ uint32_t sha1dc_fast_fused16(uint32_t ihv[5], const unsigned char *cur,
  */
 SHA1DC_TGT_AVX2
 uint32_t sha1dc_fast_fused8(uint32_t ihv[5], const unsigned char *cur,
-			    const unsigned char *next, uint32_t dvout[8],
-			    uint32_t ckpt[8][5])
+			    const unsigned char *next, uint32_t *dvout,
+			    uint32_t ckpt[][5])
 {
 	__m128i ABCD, E0;
 	u32v8 W[65];
@@ -679,7 +651,7 @@ uint32_t sha1dc_fast_fused8(uint32_t ihv[5], const unsigned char *cur,
 	return scan8_result(dv, dvout);
 }
 
-static int sha1dc_detect_fast_level(void)
+int sha1dc_fast_detect_level(void)
 {
 	unsigned int eax, ebx, ecx, edx, ebx7, lo, hi;
 	uint64_t xcr0;
@@ -702,19 +674,4 @@ static int sha1dc_detect_fast_level(void)
 	return 1;
 }
 
-static void sha1dc_fast_init(void) __attribute__((constructor));
-static void sha1dc_fast_init(void)
-{
-	const char *s;
-
-	if (getenv("SHA1DC_NO_FAST"))
-		return;
-	sha1dc_fast_level = sha1dc_detect_fast_level();
-	/* SHA1DC_FAST_LEVEL can lower (never raise) the level, for A/B tests. */
-	s = getenv("SHA1DC_FAST_LEVEL");
-	if (s && s[0] >= '0' && s[0] <= '2' && !s[1] &&
-	    s[0] - '0' < sha1dc_fast_level)
-		sha1dc_fast_level = s[0] - '0';
-}
-
-#endif /* __x86_64__ && __GNUC__ && !SHA1DC_NO_FAST_SHANI */
+#endif /* SHA1DC_FAST_SHANI && __x86_64__ */
