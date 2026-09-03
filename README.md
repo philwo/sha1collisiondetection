@@ -43,9 +43,9 @@ make
 
 ## Hardware-accelerated fast path (x86-64 and aarch64)
 
-On x86-64 with GCC or Clang, the library contains an optional fast path
-that uses the SHA-NI instructions together with an AVX-512 or AVX2
-vectorized version of the unavoidable-bit-conditions check
+On x86-64 with GCC or Clang, the library contains a fast path that uses
+the SHA-NI instructions together with an AVX-512 or AVX2 vectorized
+version of the unavoidable-bit-conditions check
 (`lib/sha1dc_fast_x86.c`, `lib/ubc_check_simd.h`). It is selected at
 run time via cpuid, needs no special compiler flags, and compiles to
 nothing on other platforms. Detection behavior is unchanged: the same
@@ -55,25 +55,77 @@ order of the work differs.
 On aarch64 the same design uses the ARMv8 SHA-1 crypto extensions
 (FEAT_SHA1) and a 4-lane NEON version of the check
 (`lib/sha1dc_fast_arm64.c`). It is selected at run time via
-sysctl (macOS) or getauxval (Linux) and has only levels 0 and 2 (there
-is no separate AVX2-style tier). The environment variables below apply
-there as well.
+sysctl (macOS) or getauxval (Linux).
 
 The fast path is used when collision detection is enabled with
-`ubc_check` on and `safe_hash` off (the configuration Git uses). With
-`safe_hash` on (the library default), the original code runs, because
-the fast path advances the hash state before the collision checks
-complete, which is only valid when a detected collision does not alter
-the output.
+`ubc_check` on and `safe_hash` off (the configuration Git uses), and
+for plain hashing with collision detection off. With `safe_hash` on
+(the library default), the original code runs, because the fast path
+advances the hash state before the collision checks complete, which is
+only valid when a detected collision does not alter the output.
 
 On an AMD Ryzen 9950X3D this raises throughput from 0.87 GB/s to
 2.25 GB/s on typical data (plain hardware SHA-1: 2.96 GB/s). On an
 Apple M2 Ultra it goes from 0.56 GB/s to 1.34 GB/s (plain hardware
-SHA-1: 2.67 GB/s). Two
-environment variables help with testing and benchmarking:
+SHA-1: 2.67 GB/s).
+
+### Building the library with the fast path
+
+The fast path is on by default. Projects that compile the library from
+source must add `lib/sha1dc_fast_x86.c` and `lib/sha1dc_fast_arm64.c`
+next to `lib/sha1.c` and `lib/ubc_check.c`; the two files compile to
+empty objects wherever the fast path is unavailable, so they can be
+listed unconditionally. They need C99 with GNU extensions (the intrinsics
+headers), not the pedantic C90 the rest of the library builds as; the
+`Makefile` shows the flags.
+
+Requirements: on x86-64, GCC 7 or later or Clang; on aarch64, GCC 8 or
+later or Clang (or any compiler with `-march=...+sha2`/`+crypto`, which
+defines `__ARM_FEATURE_SHA2`). Big-endian targets and
+`-DSHA1DC_FORCE_BIGENDIAN` builds never use it. To build without the
+fast path (and without the two extra files), define
+`SHA1DC_NO_FAST_SHANI`. The single enable condition lives in
+`lib/sha1dc_fast.h`.
+
+With `SHA1DC_NO_STANDARD_INCLUDES`, the two backend files take their
+standard headers from `SHA1DC_CUSTOM_INCLUDE_SHA1DC_FAST_X86_C` and
+`SHA1DC_CUSTOM_INCLUDE_SHA1DC_FAST_ARM64_C`, just as `sha1.c` uses
+`SHA1DC_CUSTOM_INCLUDE_SHA1_C`. Git, for example, would build with
+
+```
+sha1dc/sha1.o sha1dc/ubc_check.o sha1dc/sha1dc_fast_x86.o sha1dc/sha1dc_fast_arm64.o
+-DSHA1DC_NO_STANDARD_INCLUDES -DSHA1DC_INIT_SAFE_HASH_DEFAULT=0 \
+-DSHA1DC_CUSTOM_INCLUDE_SHA1_C='"git-compat-util.h"' \
+-DSHA1DC_CUSTOM_INCLUDE_UBC_CHECK_C='"git-compat-util.h"' \
+-DSHA1DC_CUSTOM_INCLUDE_SHA1DC_FAST_X86_C='"git-compat-util.h"' \
+-DSHA1DC_CUSTOM_INCLUDE_SHA1DC_FAST_ARM64_C='"git-compat-util.h"'
+```
+
+### Testing and benchmarking
+
+Two environment variables help with testing and benchmarking:
 `SHA1DC_NO_FAST=1` disables the fast path, and `SHA1DC_FAST_LEVEL=0|1|2`
-lowers (never raises) the detected dispatch level
-(0 = off, 1 = SHA-NI+AVX2, 2 = SHA-NI+AVX-512).
+lowers (never raises) the detected dispatch level: 0 = off,
+1 = SHA-NI+AVX2, 2 = SHA-NI+AVX-512 or FEAT_SHA1+NEON. aarch64 has no
+level 1; setting it there means off.
+
+`bin/sha1perf` (built by `make`) is the benchmark and diff-test harness;
+`make test` runs its `test`, `digest` and `vtest` modes, which compare
+every supported level and many chunk sizes against the scalar code.
+`bin/sha1perf bench <level> <random|zeros|FILE> [chunksize]` measures
+throughput, and `make SHA1PERF_OPENSSL=1 sha1perf` adds the OpenSSL
+reference (`benchssl`). See the comment at the top of `sha1perf.c` for
+all modes.
+
+`lib/ubc_check_simd.h` is generated from `lib/ubc_check.c` by
+`lib/gen_ubc_simd.py`; `make check-generated` (part of `make test`)
+verifies it is in sync, and
+
+```
+python3 lib/gen_ubc_simd.py lib/ubc_check.c --all > lib/ubc_check_simd.h
+```
+
+regenerates it after a change to `ubc_check.c`.
 
 ## Command-line usage
 

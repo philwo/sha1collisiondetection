@@ -92,7 +92,20 @@ void SHA1DCSetDetectReducedRoundCollision(SHA1_CTX*, int);
 /* by default no callback set */
 void SHA1DCSetCallback(SHA1_CTX*, collision_block_callback);
 
-/* update SHA-1 context with buffer contents */
+/*
+    Update SHA-1 context with buffer contents.
+
+    On x86-64 and aarch64 (GCC/Clang) the library contains a hardware
+    fast path (SHA-NI or FEAT_SHA1 plus a vectorized ubc_check, see
+    sha1dc_fast.h and the README) that is selected at run time. It is
+    used when collision detection is on with ubc_check on and safe_hash
+    off, and for plain hashing with collision detection off; the results
+    are identical to the portable code. Building the library then also
+    requires sha1dc_fast_x86.c and sha1dc_fast_arm64.c, unless
+    SHA1DC_NO_FAST_SHANI is defined. For testing, the environment
+    variables SHA1DC_NO_FAST=1 (off) and SHA1DC_FAST_LEVEL=0|1|2 (lower
+    the dispatch level) are read once at program start.
+*/
 void SHA1DCUpdate(SHA1_CTX*, const char*, size_t);
 
 /* obtain SHA-1 hash from SHA-1 context */
